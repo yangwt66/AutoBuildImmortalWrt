@@ -1,107 +1,129 @@
 #!/bin/sh
-# 99-custom.sh 就是immortalwrt固件首次启动时运行的脚本 位于固件内的/etc/uci-defaults/99-custom.sh
-# Log file for debugging
 LOGFILE="/tmp/uci-defaults-log.txt"
-echo "Starting 99-custom.sh at $(date)" >> $LOGFILE
-# 设置默认防火墙规则，方便虚拟机首次访问 WebUI
-uci set firewall.@zone[1].input='ACCEPT'
+exec >$LOGFILE 2>&1
+echo "=== Secure configuration script starts at $(date) ==="
 
-# 设置主机名映射，解决安卓原生 TV 无法联网的问题
-uci add dhcp domain
-uci set "dhcp.@domain[-1].name=time.android.com"
-uci set "dhcp.@domain[-1].ip=203.107.6.88"
+# ---------------------------
+# 安全基础配置
+# ---------------------------
 
-# 检查配置文件pppoe-settings是否存在 该文件由build.sh动态生成
-SETTINGS_FILE="/etc/config/pppoe-settings"
-if [ ! -f "$SETTINGS_FILE" ]; then
-    echo "PPPoE settings file not found. Skipping." >> $LOGFILE
-else
-   # 读取pppoe信息($enable_pppoe、$pppoe_account、$pppoe_password)
-   . "$SETTINGS_FILE"
-fi
+# 强制保持 WAN 区域默认安全策略 (INPUT: REJECT)
+uci set firewall.@zone[1].input='REJECT' && 
+    echo "[Firewall] WAN zone policy set to REJECT"
 
-# 计算网卡数量
-count=0
+# ---------------------------
+# 服务访问控制
+# ---------------------------
+
+# TTYD 安全配置 (仅允许 LAN 访问)
+uci set ttyd.@ttyd[0].interface='br-lan' &&
+    echo "[TTYD] Restricted to LAN interface"
+
+# SSH 安全配置 (仅允许 LAN 访问)
+uci set dropbear.@dropbear[0].Interface='lan' &&
+    echo "[SSH] Restricted to LAN interface"
+
+# ---------------------------
+# 防火墙增强规则
+# ---------------------------
+
+# 删除可能存在的临时放行规则
+uci -q delete firewall.allow_webui
+
+# 添加明确的 LAN 访问规则
+uci add firewall rule
+uci set firewall.@rule[-1].name='Allow-LAN-WebUI'
+uci set firewall.@rule[-1].src='lan'
+uci set firewall.@rule[-1].proto='tcp'
+uci set firewall.@rule[-1].dest_port='80 443'
+uci set firewall.@rule[-1].target='ACCEPT' &&
+    echo "[Firewall] Added LAN WebUI access rule"
+
+# 禁止 WAN 访问管理服务
+uci add firewall rule
+uci set firewall.@rule[-1].name='Block-WAN-Admin'
+uci set firewall.@rule[-1].src='wan'
+uci set firewall.@rule[-1].proto='tcp'
+uci set firewall.@rule[-1].dest_port='22 80 443'
+uci set firewall.@rule[-1].target='REJECT' &&
+    echo "[Firewall] Blocked WAN admin access"
+
+# ---------------------------
+# 安全网络配置
+# ---------------------------
+
+# 静态 DNS 映射 (安全方式)
+uci add_list dhcp.@dnsmasq[0].address="/time.android.com/203.107.6.88" &&
+    echo "[DNS] Added secure static mapping"
+
+# 禁用不必要的 DHCP 选项
+uci set dhcp.lan.dhcpv6='disabled' &&
+    echo "[DHCP] Disabled IPv6 DHCP"
+
+# ---------------------------
+# 网络接口配置
+# ---------------------------
+
+# 物理网卡检测 (安全增强版)
 ifnames=""
 for iface in /sys/class/net/*; do
-  iface_name=$(basename "$iface")
-  # 检查是否为物理网卡（排除回环设备和无线设备）
-  if [ -e "$iface/device" ] && echo "$iface_name" | grep -Eq '^eth|^en'; then
-    count=$((count + 1))
-    ifnames="$ifnames $iface_name"
-  fi
+    iface_name=$(basename "$iface")
+    if [ -e "$iface/device" ] && [ "$(cat $iface/type 2>/dev/null)" = "1" ]; then
+        ifnames="$ifnames $iface_name"
+        echo "[Network] Valid physical interface: $iface_name"
+    fi
 done
-# 删除多余空格
-ifnames=$(echo "$ifnames" | awk '{$1=$1};1')
+ifnames=$(echo $ifnames | xargs)
 
-# 网络设置
-if [ "$count" -eq 1 ]; then
-   # 单网口设备 类似于NAS模式 动态获取ip模式 具体ip地址取决于上一级路由器给它分配的ip 也方便后续你使用web页面设置旁路由
-   # 单网口设备 不支持修改ip 不要在此处修改ip 
-   uci set network.lan.proto='dhcp'
-elif [ "$count" -gt 1 ]; then
-   # 提取第一个接口作为WAN
-   wan_ifname=$(echo "$ifnames" | awk '{print $1}')
-   # 剩余接口保留给LAN
-   lan_ifnames=$(echo "$ifnames" | cut -d ' ' -f2-)
-   # 设置WAN接口基础配置
-   uci set network.wan=interface
-   # 提取第一个接口作为WAN
-   uci set network.wan.device="$wan_ifname"
-   # WAN接口默认DHCP
-   uci set network.wan.proto='dhcp'
-   # 设置WAN6绑定网口eth0
-   uci set network.wan6=interface
-   uci set network.wan6.device="$wan_ifname"
-   # 更新LAN接口成员
-   # 查找对应设备的section名称
-   section=$(uci show network | awk -F '[.=]' '/\.@?device\[\d+\]\.name=.br-lan.$/ {print $2; exit}')
-   if [ -z "$section" ]; then
-      echo "error：cannot find device 'br-lan'." >> $LOGFILE
-   else
-      # 删除原来的ports列表
-      uci -q delete "network.$section.ports"
-      # 添加新的ports列表
-      for port in $lan_ifnames; do
-         uci add_list "network.$section.ports"="$port"
-      done
-      echo "ports of device 'br-lan' are update." >> $LOGFILE
-   fi
-   # LAN口设置静态IP
-   uci set network.lan.proto='static'
-   # 多网口设备 支持修改为别的ip地址
-   uci set network.lan.ipaddr='192.168.100.1'
-   uci set network.lan.netmask='255.255.255.0'
-   echo "set 192.168.100.1 at $(date)" >> $LOGFILE
-   # 判断是否启用 PPPoE
-   echo "print enable_pppoe value=== $enable_pppoe" >> $LOGFILE
-   if [ "$enable_pppoe" = "yes" ]; then
-      echo "PPPoE is enabled at $(date)" >> $LOGFILE
-      # 设置ipv4宽带拨号信息
-      uci set network.wan.proto='pppoe'
-      uci set network.wan.username=$pppoe_account
-      uci set network.wan.password=$pppoe_password
-      uci set network.wan.peerdns='1'
-      uci set network.wan.auto='1'
-      # 设置ipv6 默认不配置协议
-      uci set network.wan6.proto='none'
-      echo "PPPoE configuration completed successfully." >> $LOGFILE
-   else
-      echo "PPPoE is not enabled. Skipping configuration." >> $LOGFILE
-   fi
+# 多网卡配置
+if [ $(echo $ifnames | wc -w) -gt 1 ]; then
+    wan_ifname=$(echo $ifnames | awk '{print $1}')
+    lan_ifnames=$(echo $ifnames | cut -d' ' -f2-)
+
+    # 强制 LAN 口静态 IP
+    uci set network.lan.proto='static'
+    uci set network.lan.ipaddr='192.168.10.66'
+    uci set network.lan.netmask='255.255.255.0' &&
+        echo "[Network] Set secure LAN IP"
+
+    # 桥接端口绑定验证
+    section=$(uci show network | awk -F '[.=]' '/\.@?device\[\d+\]\.name=.br-lan.$/ {print $2; exit}')
+    [ -n "$section" ] && {
+        uci -q delete "network.$section.ports"
+        for port in $lan_ifnames; do
+            uci add_list "network.$section.ports"="$port"
+        done
+        echo "[Bridge] Secured bridge ports: $lan_ifnames"
+    }
 fi
 
+# ---------------------------
+# PPPoE 安全配置
+# ---------------------------
 
-# 设置所有网口可访问网页终端
-uci delete ttyd.@ttyd[0].interface
+SETTINGS_FILE="/etc/config/pppoe-settings"
+if [ -f "$SETTINGS_FILE" ]; then
+    . "$SETTINGS_FILE"
+    [ "$enable_pppoe" = "yes" ] && {
+        uci set network.wan.proto='pppoe'
+        uci set network.wan.username="$pppoe_account"
+        uci set network.wan.password="$pppoe_password"
+        uci set network.wan6.proto='none' &&
+            echo "[PPPoE] Configured with credential protection"
+    }
+fi
 
-# 设置所有网口可连接 SSH
-uci set dropbear.@dropbear[0].Interface=''
+# ---------------------------
+# 最终安全措施
+# ---------------------------
+
+# 提交所有配置
 uci commit
 
-# 设置编译作者信息
-FILE_PATH="/etc/openwrt_release"
-NEW_DESCRIPTION="Compiled by wukongdaily"
-sed -i "s/DISTRIB_DESCRIPTION='[^']*'/DISTRIB_DESCRIPTION='$NEW_DESCRIPTION'/" "$FILE_PATH"
+# 强制刷新服务配置
+service firewall restart
+service network restart
+service dnsmasq restart
 
+echo "=== Secure configuration completed at $(date) ==="
 exit 0
